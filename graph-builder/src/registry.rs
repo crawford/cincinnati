@@ -18,7 +18,7 @@ extern crate futures;
 extern crate tokio_core;
 
 use cincinnati;
-use failure::Error;
+use failure::{Error, ResultExt};
 use flate2::read::GzDecoder;
 use registry::futures::future::{self, Either, Future};
 use registry::futures::prelude::*;
@@ -34,6 +34,8 @@ use std::{
     string::String,
 };
 use tar::Archive;
+
+pub const INTERNAL_LABEL_PREFIX: &str = "internal.openshift.io/";
 
 #[derive(Debug, Clone)]
 pub struct Release {
@@ -157,8 +159,12 @@ pub fn fetch_releases(
                 authenticated_client.clone(),
                 registry_host.into(),
                 repo.into(),
-                tag,
+                tag.clone(),
             )
+            .and_then(|release| match registry_host {
+                "quay.io" => add_quay_labels(registry, repo, tag, release),
+                _ => Ok(release),
+            })
         })
         .collect();
 
@@ -349,4 +355,69 @@ where
             )),
         ),
     }
+}
+
+#[derive(Deserialize)]
+struct QuayTags {
+    tags: Vec<QuayTag>,
+}
+
+#[derive(Deserialize)]
+struct QuayTag {
+    manifest_digest: String,
+}
+
+#[derive(Deserialize)]
+struct QuayLabels {
+    labels: Vec<QuayLabel>,
+}
+
+#[derive(Deserialize)]
+struct QuayLabel {
+    key: String,
+    value: String,
+}
+
+fn add_quay_labels(
+    registry: &str,
+    repo: &str,
+    tag: String,
+    mut release: Release,
+) -> Result<Release, Error> {
+    let manifest_digest = match reqwest::Client::new()
+        .get(&format!("{}/api/v1/repository/{}/tag", registry, repo))
+        .query(&[("specificTag", tag)])
+        .send()
+        .context("failed to fetch tag metadata")?
+        .error_for_status()
+        .context("failed to fetch tag metadata")?
+        .json::<QuayTags>()
+        .context("failed to parse tag metadata")?
+        .tags
+        .into_iter()
+        .next()
+    {
+        Some(tag) => tag.manifest_digest,
+        None => return Ok(release),
+    };
+
+    let labels = reqwest::get(&format!(
+        "{}/api/v1/repository/{}/manifest/{}/labels",
+        registry, repo, manifest_digest
+    ))
+    .context("failed to fetch labels")?
+    .error_for_status()
+    .context("failed to fetch labels")?
+    .json::<QuayLabels>()
+    .context("failed to parse labels")?
+    .labels;
+
+    for label in labels.into_iter() {
+        release
+            .metadata
+            .metadata
+            .insert(INTERNAL_LABEL_PREFIX.to_owned() + &label.key, label.value);
+    }
+
+    Ok(release)
 }
